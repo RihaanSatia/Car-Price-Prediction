@@ -1,0 +1,1139 @@
+---
+title: "polishedPAC"
+date: "2023-11-11"
+output: 
+  html_document:
+    theme: yeti
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## LOADING LIBRARIES
+
+```{r}
+library(ggplot2)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(ipred)
+library(randomForest)
+library(stringr)
+library(readr)
+library(yardstick)
+library(recipes)
+library(ranger)
+library(rpart)
+library(rpart.plot)
+library(ggcorrplot)
+library(lubridate)
+```
+
+## READING DATA
+
+```{r}
+usedcars = read.csv('C:/Users/admin/Desktop/Fall 2023/Frameworks and Methods/PAC/analysisData.csv')
+
+scoringData = read.csv('C:/Users/admin/Desktop/Fall 2023/Frameworks and Methods/PAC/scoringData.csv')
+
+#scoringDataImputed = read.csv('C:/Users/admin/Desktop/Fall 2023/Frameworks and Methods/PAC/scoringDataImputed.csv')
+
+```
+
+### DATA TYPE HANDLING FOR ANALYSIS DATASET
+
+```{r}
+usedcars$fuel_type <- as.factor(usedcars$fuel_type)
+usedcars$engine_type <- as.factor(usedcars$engine_type)
+usedcars$body_type <- as.factor(usedcars$body_type)
+usedcars$transmission <- as.factor(usedcars$transmission)
+usedcars$transmission_display <- as.factor(usedcars$transmission_display)
+usedcars$wheel_system <- as.factor(usedcars$wheel_system)
+usedcars$maximum_seating <- as.factor(usedcars$maximum_seating)
+usedcars$listed_date <- as.Date(usedcars$listed_date)
+#usedcars$model_name <- as.factor(usedcars$model_name)
+```
+
+### DATA CLEANING [*(do not run this)*]{style="color:red;"}
+
+-   The idea behind converting TRUE/FALSE strings to actual booleans was to give the columns their real meaning. But it didnt make much difference in terms of RMSE
+
+```{r}
+char_columns <- sapply(usedcars, is.character)
+
+# Apply conversion to TRUE for "True" and FALSE for "False" strings across character columns
+usedcars[char_columns] <- lapply(usedcars[char_columns], function(x) {
+  x[x == "True"] <- TRUE
+  x[x == "False"] <- FALSE
+  return(x)
+})
+char_columns
+usedcars$is_new <- lapply(usedcars$is_new, as.logical)
+usedcars$is_new[1]
+```
+
+### DATA TYPE HANDLING FOR TESTING DATASET
+
+```{r}
+scoringData$fuel_type <- as.factor(scoringData$fuel_type)
+scoringData$engine_type <- as.factor(scoringData$engine_type)
+scoringData$body_type <- as.factor(scoringData$body_type)
+scoringData$transmission <- as.factor(scoringData$transmission)
+scoringData$transmission_display <- as.factor(scoringData$transmission_display)
+scoringData$wheel_system <- as.factor(scoringData$wheel_system)
+scoringData$maximum_seating <- as.factor(scoringData$maximum_seating)
+scoringData$listed_date <- as.Date(scoringData$listed_date)
+#scoringData$model_name <- as.factor(scoringData$model_name)
+```
+
+### COLUMNS WITH MORE THAN 20% BLANKS
+
+-   used to decide which columns to impute and which columns to fill with *"unkown"*
+
+```{r}
+blank_percentages <- colMeans(usedcars == "") * 100
+# Create a new data frame combining column names and their respective blank percentages
+columns_with_high_blanks <- names(blank_percentages[blank_percentages > 20 & !is.na(blank_percentages)])
+print(columns_with_high_blanks)
+```
+
+### CHECK FCT COUNTS
+
+-   to check the number of categories of any variable (left incomplete as I kept changing to check each variable)
+
+```{r}
+#fct_count(usedcars$)
+```
+
+### CHECK GROUPED PRICE MEANS
+
+-   used to develop the features in feature engineering, and to see which variables have an impact
+
+```{r}
+x <- usedcars |>
+  group_by(usedcars$make_name) |>
+  summarise(avg=mean(price)) |>
+  arrange(desc(avg))
+```
+
+### EXTRACTING NEW DATA
+
+-   Feature Engineering
+
+```{r}
+to_list <- function(x) {
+  str_extract_all(x, "\\w+") %>%
+    unlist()
+}
+```
+
+```{r}
+#From Engine Type
+usedcars$NumCylinders <- as.numeric(gsub("[^0-9]", "", usedcars$engine_type))
+usedcars$engine_initial <- substr(usedcars$engine_type, 1, 1)
+usedcars$engine_initial <- trimws(usedcars$engine_initial)
+usedcars$flex_fuel <- grepl("Flex Fuel Vehicle", usedcars$engine_type)
+
+#From transmission display
+usedcars$transmission_number <- as.numeric(gsub("[^0-9]", "",usedcars$transmission_display))
+usedcars$transmission_number[is.na(usedcars$transmission_number)] <- 0
+
+#From power
+usedcars$rpm <- as.numeric(gsub("[^0-9]", "", sub(".+@ (.+) RPM", "\\1", usedcars$power)))
+#Color
+usedcars$intcolor_cleaned <- tolower(trimws(gsub("^\\s*(\\w+).*", "\\1", usedcars$interior_color)))
+
+#This variable has a non linear relationship (quadratic)
+usedcars$yearage_at_listing <- year(usedcars$listed_date) - usedcars$year
+
+#From Major Options
+usedcars$roofs <- grepl("Sunroof|Moonroof", usedcars$major_options)
+usedcars$third_row <- grepl("Third Row Seating", usedcars$major_options)
+usedcars$heated_seats <- grepl("Heated Seats", usedcars$major_options)
+usedcars$leather <- grepl("Leather", usedcars$major_options)
+usedcars$cruise_control <- grepl("Cruise", usedcars$major_options)
+usedcars$blind_spot_monitoring <- grepl("Blind", usedcars$major_options)
+usedcars$premium <- grepl("Premium", usedcars$major_options)
+usedcars$climate_control <- grepl("Climate", usedcars$major_options)
+usedcars$luxury <- grepl("Luxury", usedcars$major_options)
+usedcars$sport <- grepl("Sport", usedcars$major_options)
+usedcars$steel_wheels <- grepl("Steel Wheels", usedcars$major_options)
+
+usedcars <- usedcars %>%
+  mutate(major_options = lapply(major_options, to_list)) %>%
+  mutate(num_features = lengths(major_options))
+#usedcars$major_options <- sapply(usedcars$major_options, paste, collapse = " ")
+#TRY
+usedcars$size <- usedcars$height_inches*usedcars$width_inches*usedcars$length_inches
+
+usedcars$avg_economy <- (usedcars$city_fuel_economy+usedcars$highway_fuel_economy)/2
+
+```
+
+```{r}
+#From Engine Type
+scoringData$NumCylinders <- as.numeric(gsub("[^0-9]", "", scoringData$engine_type))
+scoringData$engine_initial <- substr(scoringData$engine_type, 1, 1)
+scoringData$engine_initial <- trimws(scoringData$engine_initial)
+scoringData$flex_fuel <- grepl("Flex Fuel Vehicle", scoringData$engine_type)
+
+#From transmission display
+scoringData$transmission_number <- as.numeric(gsub("[^0-9]", "",scoringData$transmission_display))
+scoringData$transmission_number[is.na(scoringData$transmission_number)] <- 0
+
+#From power
+scoringData$rpm <- as.numeric(gsub("[^0-9]", "", sub(".+@ (.+) RPM", "\\1", scoringData$power)))
+
+#color
+scoringData$intcolor_cleaned <- tolower(trimws(gsub("^\\s*(\\w+).*", "\\1", scoringData$interior_color)))
+
+#This variable has a non linear relationship (quadratic)
+scoringData$yearage_at_listing <- year(scoringData$listed_date) - scoringData$year
+
+#from Major Options
+scoringData$roofs <- grepl("Sunroof|Moonroof", scoringData$major_options)
+scoringData$third_row <- grepl("Third Row Seating", scoringData$major_options)
+scoringData$heated_seats <- grepl("Heated Seats", scoringData$major_options)
+scoringData$leather <- grepl("Leather", scoringData$major_options)
+scoringData$cruise_control <- grepl("Cruise", scoringData$major_options)
+scoringData$blind_spot_monitoring <- grepl("Blind", scoringData$major_options)
+scoringData$premium <- grepl("Premium", scoringData$major_options)
+scoringData$climate_control <- grepl("Climate", scoringData$major_options)
+scoringData$luxury <- grepl("Luxury", scoringData$major_options)
+scoringData$sport <- grepl("Sport", scoringData$major_options)
+scoringData$steel_wheels <- grepl("Steel Wheels", scoringData$major_options)
+
+scoringData <- scoringData %>%
+  mutate(major_options = lapply(major_options, to_list)) %>%
+  mutate(num_features = lengths(major_options))
+
+
+scoringData$size <- scoringData$height_inches*scoringData$width_inches*scoringData$length_inches
+scoringData$avg_economy <- (scoringData$city_fuel_economy+scoringData$highway_fuel_economy)/2
+```
+
+### Add a brand type column for car companies
+
+-   *make_name*, although being a strong predictor can be computationally heavy to use in a model. This is because it has 46 categories. Any model that would take use of this would generate 46 new variables, which would increase the computation by a lot. As a result, grouping brand names by the market they cater to, will reduce the number of variables too
+
+```{r}
+bins <- c(0, 10000, 20000, 30000, 40000, 50000,60000, Inf)  # Define your desired price intervals
+usedcars <- usedcars |>
+  group_by(make_name) |>
+  mutate(avg_per_brand = mean(price)) |>
+  ungroup()
+
+# Create a new column 'brand_type' representing the bin for each car
+usedcars$brand_type <- cut(usedcars$avg_per_brand, bins, labels = c('Very Nominal', 'Nominal', 'Average', 'Above Average', 'Luxury','Very Luxury','Ultra Luxury'), include.lowest = TRUE)
+brand_mapping <-data.frame(usedcars |>
+  select(make_name,brand_type) |>
+  unique())
+scoringData <- inner_join(scoringData,brand_mapping,by="make_name")
+```
+
+#### Combined Factors from analysis and scoring Data to cover all possible factors
+
+-   *engine_initial* seemes to have new categories introduced in the testing data, which was causing issues in predicting with the model. As a result, added those categories in both the datasets by taking a superset of all categories from usedcars and scoringData.
+
+```{r}
+usedcars$engine_initial <- as.factor(usedcars$engine_initial)
+scoringData$engine_initial <- as.factor(scoringData$engine_initial)
+train_levels <- levels(usedcars$engine_initial)
+score_levels <- levels(scoringData$engine_initial)
+# Combine unique levels and make them consistent in both datasets
+all_levels <- union(train_levels, score_levels)
+
+# Update factor levels in both datasets
+usedcars$engine_initial <- factor(usedcars$engine_initial, levels = all_levels)
+scoringData$engine_initial <- factor(scoringData$engine_initial, levels = all_levels)
+```
+
+### VISUALIZE RELATIONSHIPS
+
+```{r}
+usedcars |>
+  group_by(NumCylinders) |>
+  summarise(avg_price = mean(price)) |>
+  arrange(desc(avg_)) |>
+  ggplot(aes(x=NumCylinders,y=avg_price)) +geom_line()
+usedcars |>
+  group_by(yearage_at_listing) |>
+  summarise(avg_price = mean(price)) |>
+  arrange(desc(avg_price)) |>
+  ggplot(aes(x=yearage_at_listing,y=avg_price)) +geom_line() 
+```
+
+### CORRELATION TESTS
+
+```{r}
+cor.test(usedcars$wheelbase_inches, usedcars$length_inches)
+cor.test(usedcars$front_legroom_inches,usedcars$back_legroom_inches)
+```
+
+```{r}
+#wheel system and wheel system display have perfect correlation
+contingency_table <- table(usedcars$wheel_system, usedcars$wheel_system_display)
+
+chi_square_result <- chisq.test(contingency_table)
+
+n <- sum(contingency_table)
+rows <- nrow(contingency_table)
+cols <- ncol(contingency_table)
+
+cramers_v <- sqrt(chi_square_result$statistic / (n * min(rows - 1, cols - 1)))
+
+# Print Cramer's V
+print(cramers_v)
+```
+
+-   Using wheelbase_inches and length inches together may not be the best idea
+-   wheel_system_display and wheel_system are correlated
+
+```{r}
+boolean_columns <- usedcars %>%
+  select_if(is.logical) %>%
+  names()
+cor_matrix <- cor(usedcars[boolean_columns], method = "pearson")
+
+ggcorrplot(cor(cor_matrix),
+           method = 'square',
+           type = 'lower',
+           show.diag = F,
+           colors = c('#e9a3c9', '#f7f7f7', '#a1d76a'))
+print(cor_matrix)
+```
+
+-   Reducing variables for XGBoost (Checking correlation between boolean variables)
+
+### FACTORIZE NEW PREDICTORS
+
+-   used to convert new predictors to factors if required, If none found to be requiring conversion, converting older variables that might be useful in certain ML models
+
+```{r}
+#str(usedcars)
+usedcars$listing_color <- as.factor(usedcars$listing_color)
+usedcars$make_name <- as.factor(usedcars$make_name)
+usedcars$model_name <- as.factor(usedcars$model_name)
+
+scoringData$make_name <- as.factor(scoringData$make_name)
+scoringData$listing_color <- as.factor(scoringData$listing_color)
+scoringData$model_name <- as.factor(scoringData$model_name)
+```
+
+### Convert blanks to N/A's in the analysis data [*(do not run this)*]{style="color:red;"}
+
+-   Tried to convert blanks to N/A's as all imputation methods in R look for N/A's to impute (did not work, messed up the data)
+
+```{r}
+usedcars <- usedcars %>%
+  mutate_all(~ ifelse(. == "", NA, as.character(.)))
+```
+
+### Convert blanks to N/A's in the scoring data [*(do not run this)*]{style="color:red;"}
+
+```{r}
+scoringData <- scoringData %>%
+  mutate_all(~ ifelse(. =="",NA, as.character(.)))
+```
+
+### Check Percentage of NA's in each column
+
+```{r}
+missing_percentage <- data.frame(Percentage =apply(usedcars,
+      MARGIN = 2, 
+      FUN = function(x) 100*sum(is.na(x))/(sum(is.na(x))+ sum(!is.na(x)))))
+missing_percentage <- missing_percentage |>
+  arrange(desc(Percentage))
+missing_percentage
+```
+
+### Check Percentage of Blanks in each column
+
+```{r}
+percentage_blanks <- function(column) {
+  mean(column == "") * 100
+}
+
+# Apply the function to all columns
+blank_percentages <- sapply(usedcars, percentage_blanks)
+result <- data.frame(Column = names(usedcars), Percentage_Blanks = blank_percentages)
+result <- result |>
+  arrange(desc(Percentage_Blanks))
+#write.csv(result,"blanks.csv")
+result
+```
+
+### IDENTIFY COLUMNS FOR IMPUTATION
+
+-   After trying various types of imputation, including step_impute_median from recipe, I found it wasn't fullproof. I wasnt able to find a good way to impute in character columns and this method seemed to be the best at doing what I wanted
+
+```{r}
+method_list <- list("fuel_tank_volume_gallons" = "pmm","highway_fuel_economy" = "pmm","city_fuel_economy" = "pmm","engine_displacement"="pmm","horsepower" = "pmm","fuel_type" = "polyreg", "transmission" = "polyreg","transmission_display" = "polyreg", "wheel_system" = "polyreg","engine_type" = "polyreg","salvage" = "logreg")
+
+
+
+```
+
+-   This lists excludes Fleet, Frame_damaged, has_accidents, isCab, is_cpo as they have a lot of N/A values. The analysis was done in above sections
+
+### CONVERT NA'S TO UNAVAIL
+
+-   For the variables mentioned above, replacing missing values with unavailable
+
+```{r}
+usedcars <- usedcars %>%
+  mutate_at(vars(all_of(c("has_accidents","frame_damaged","isCab","fleet"))), ~ ifelse(. == "", "unavailable", .))
+usedcars <- usedcars %>%
+  mutate_at(vars(all_of(c("is_cpo"))), ~ ifelse(. == "", FALSE, .))
+```
+
+```{r}
+scoringData <- scoringData %>%
+  mutate_at(vars(all_of(c("has_accidents","frame_damaged","isCab","fleet"))), ~ ifelse(. == "", "unavailable", .))
+scoringData <- scoringData %>%
+  mutate_at(vars(all_of(c("is_cpo"))), ~ ifelse(. == "", FALSE, .))
+```
+
+### DROP UNWANTED COLUMNS
+
+-   Dropping unwanted columns, changed as per requirement for each model. Tried to keep as many as possible, so as to keep more options available for selection during model fitting
+
+```{r}
+usedcars <- usedcars %>% select(-description, -id, -trim_name, -major_options, -wheel_system_display, -year, -avg_per_brand )
+```
+
+```{r}
+scoringData <- scoringData %>% select(-description, -trim_name, -major_options, -wheel_system_display,-year)
+```
+
+### Impute Missing values in analysis data [*(do not run this)*]{style="color:red;"}
+
+-   Tried imputing using the recipe package (did not give better results)
+
+```{r}
+train_recipe = recipe(price~.,data = usedcars) |>
+                step_impute_median(all_numeric())|>
+                prep()
+usedcars = train_recipe |>
+  bake(new_data = NULL)
+#sum(is.na(scoringData))
+```
+
+### IMPUTE MISSING VALUES IN ANALYSIS DATA
+
+-   Imputes all numerical columns based on the other columns present in the dataset
+
+    (**NOTE:** Imputation parts take longer to run: *Approx 30mins-1hr*)
+
+```{r}
+library(mice)
+usedcars = mice::complete(mice(usedcars,method = 'rf',seed = 617))
+
+```
+
+-   Imputes remaining columns with the defined imputation method. Used a temporary dataset which had a subset of columns from the original data for this procedure, as passing all columns for imputation was computationally heavy.
+
+```{r}
+library(mice)
+test1 <- usedcars[, c("NumCylinders","fuel_tank_volume_gallons","highway_fuel_economy","city_fuel_economy","engine_displacement","horsepower","fuel_type","transmission","transmission_display","wheel_system","engine_type","wheelbase_inches","back_legroom_inches","mileage","height_inches")]
+test1$fuel_type[test1$fuel_type == ""] <- NA
+test1$transmission[test1$transmission == ""] <- NA
+test1$transmission_display[test1$transmission_display == ""] <- NA
+test1$wheel_system[test1$wheel_system == ""] <- NA
+test1$engine_type[test1$engine_type == ""] <- NA
+method_list <- list("NumCylinders"="pmm","fuel_tank_volume_gallons" = "pmm","highway_fuel_economy" = "pmm","city_fuel_economy" = "pmm","engine_displacement"="pmm","horsepower" = "pmm","fuel_type" = "polyreg", "transmission" = "polyreg","transmission_display" = "polyreg", "wheel_system" = "polyreg","engine_type" = "polyreg","wheelbase_inches"="pmm","back_legroom_inches"="pmm","mileage"="pmm","height_inches"="pmm")
+test1 = mice::complete(mice(test1,method = method_list,seed = 617))
+```
+
+```{r}
+usedcars$fuel_type <- test1$fuel_type
+usedcars$transmission <- test1$transmission
+usedcars$transmission_display <- test1$transmission_display
+usedcars$wheel_system <- test1$wheel_system
+
+```
+
+```{r}
+test1 <- usedcars[, c("NumCylinders","fuel_tank_volume_gallons","highway_fuel_economy","city_fuel_economy","engine_displacement","horsepower","fuel_type","transmission","transmission_display","engine_type","wheelbase_inches","back_legroom_inches","mileage")]
+
+test1$engine_type[test1$engine_type == ""] <- NA
+
+method_list <- list("NumCylinders"="pmm","fuel_tank_volume_gallons" = "pmm","highway_fuel_economy" = "pmm","city_fuel_economy" = "pmm","engine_displacement"="pmm","horsepower" = "pmm","fuel_type" = "polyreg", "transmission" = "polyreg","transmission_display" = "polyreg", "engine_type" = "polyreg","wheelbase_inches"="pmm","back_legroom_inches"="pmm","mileage"="pmm")
+test1 = mice::complete(mice(test1,method = method_list,seed = 617))
+```
+
+-   Put it back in original DF
+
+```{r}
+usedcars$engine_type <- test1$engine_type
+
+```
+
+-   Re extract variables
+
+```{r}
+usedcars$NumCylinders <- as.numeric(gsub("[^0-9]", "", usedcars$engine_type))
+usedcars$engine_initial <- substr(usedcars$engine_type, 1, 1)
+usedcars$engine_initial <- trimws(usedcars$engine_initial)
+usedcars$flex_fuel <- grepl("Flex Fuel Vehicle", usedcars$engine_type)
+usedcars$transmission_number <- as.numeric(gsub("[^0-9]", "",usedcars$transmission_display))
+usedcars$transmission_number[is.na(usedcars$transmission_number)] <- 0
+```
+
+### WRITE IMPUTED FILE
+
+*I saved my imputed file to csv in order to avoid repetition of time consuming processes*
+
+```{r}
+write.csv(usedcars, 'imputedanalysis.csv',row.names = F)
+```
+
+### IMPUTE MISSING VALUES IN SCORING DATA
+
+```{r}
+library(mice)
+scoringData = mice::complete(mice(scoringData, method = 'rf',seed = 617))
+```
+
+```{r}
+library(mice)
+test1 <- scoringData[, c("NumCylinders","fuel_tank_volume_gallons","highway_fuel_economy","city_fuel_economy","engine_displacement","horsepower","fuel_type","transmission","transmission_display","wheel_system","engine_type","wheelbase_inches","back_legroom_inches","mileage","height_inches")]
+test1$fuel_type[test1$fuel_type == ""] <- NA
+test1$transmission[test1$transmission == ""] <- NA
+test1$transmission_display[test1$transmission_display == ""] <- NA
+test1$wheel_system[test1$wheel_system == ""] <- NA
+test1$engine_type[test1$engine_type == ""] <- NA
+method_list <- list("NumCylinders"="pmm","fuel_tank_volume_gallons" = "pmm","highway_fuel_economy" = "pmm","city_fuel_economy" = "pmm","engine_displacement"="pmm","horsepower" = "pmm","fuel_type" = "polyreg", "transmission" = "polyreg","transmission_display" = "polyreg", "wheel_system" = "polyreg","engine_type" = "polyreg","wheelbase_inches"="pmm","back_legroom_inches"="pmm","mileage"="pmm","height_inches"="pmm")
+test1 = mice::complete(mice(test1,method = method_list,seed = 617))
+```
+
+```{r}
+scoringData$fuel_type <- test1$fuel_type
+scoringData$transmission <- test1$transmission
+scoringData$transmission_display <- test1$transmission_display
+scoringData$wheel_system <- test1$wheel_system
+scoringData$engine_type <- test1$engine_type
+```
+
+```{r}
+scoringData$NumCylinders <- as.numeric(gsub("[^0-9]", "", scoringData$engine_type))
+scoringData$engine_initial <- substr(scoringData$engine_type, 1, 1)
+scoringData$engine_initial <- trimws(scoringData$engine_initial)
+scoringData$flex_fuel <- grepl("Flex Fuel Vehicle", scoringData$engine_type)
+scoringData$transmission_number <- as.numeric(gsub("[^0-9]", "",scoringData$transmission_display))
+scoringData$transmission_number[is.na(scoringData$transmission_number)] <- 0
+```
+
+### WRITE IMPUTED FILE
+
+*I saved my imputed file to csv in order to avoid repetition of time consuming processes*
+
+```{r}
+write.csv(scoringData, 'imputedscoring.csv',row.names = F)
+```
+
+### PRINCIPAL COMPONENT ANALYSIS
+
+```{r}
+correlated_vars <- usedcars[, c('city_fuel_economy', 'highway_fuel_economy')]
+
+scaled_data <- scale(correlated_vars)  # Standardize the data
+scaled_data
+pca_result <- prcomp(scaled_data, scale. = TRUE)
+pca_components <- pca_result$rotation
+```
+
+### Some more Feature Engineering that didnt work [*(do not run the following two code blocks)*]{style="color:red;"}
+
+-   Did not have good predicting power
+
+```{r}
+usedcars <- usedcars %>%
+  mutate(tank_category = case_when(
+    fuel_tank_volume_gallons >= 0 & fuel_tank_volume_gallons < 10 ~ "0-10s",
+    fuel_tank_volume_gallons >= 10 & fuel_tank_volume_gallons < 13 ~ "11-13s",
+    fuel_tank_volume_gallons >= 13 & fuel_tank_volume_gallons < 16 ~ "14-16s",
+    fuel_tank_volume_gallons >= 16 & fuel_tank_volume_gallons < 19 ~ "17-19s",
+    fuel_tank_volume_gallons >= 19 & fuel_tank_volume_gallons < 22 ~ "20-22s",
+    fuel_tank_volume_gallons >= 22 & fuel_tank_volume_gallons < 25 ~ "23-25s",
+    fuel_tank_volume_gallons >= 25 ~ "highs",
+    TRUE ~ NA_character_  # Add this line to handle cases outside defined ranges
+  ))
+usedcars$tank_category <- as.factor(usedcars$tank_category)
+```
+
+```{r}
+scoringData <- scoringData %>%
+  mutate(tank_category = case_when(
+    fuel_tank_volume_gallons >= 0 & fuel_tank_volume_gallons < 10 ~ "0-10s",
+    fuel_tank_volume_gallons >= 10 & fuel_tank_volume_gallons < 13 ~ "11-13s",
+    fuel_tank_volume_gallons >= 13 & fuel_tank_volume_gallons < 16 ~ "14-16s",
+    fuel_tank_volume_gallons >= 16 & fuel_tank_volume_gallons < 19 ~ "17-19s",
+    fuel_tank_volume_gallons >= 19 & fuel_tank_volume_gallons < 22 ~ "20-22s",
+    fuel_tank_volume_gallons >= 22 & fuel_tank_volume_gallons < 25 ~ "23-25s",
+    fuel_tank_volume_gallons >= 25 ~ "highs",
+    TRUE ~ NA_character_  # Add this line to handle cases outside defined ranges
+  ))
+usedcars$tank_category <- as.factor(usedcars$tank_category)
+```
+
+### READ IMPUTED DATA
+
+```{r}
+
+imputedAnalysis <- read.csv('C:/Users/admin/Desktop/Fall 2023/Frameworks and Methods/PAC/imputedanalysis.csv')
+imputedScoring <- read.csv('C:/Users/admin/Desktop/Fall 2023/Frameworks and Methods/PAC/imputedscoring.csv')
+
+```
+
+```{r}
+imputedAnalysis$torque <- as.numeric(gsub("^(\\d+).*", "\\1", imputedAnalysis$torque))
+imputedScoring$torque <- as.numeric(gsub("^(\\d+).*", "\\1", imputedScoring$torque))
+```
+
+```{r}
+library(mice)
+imputedAnalysis = mice::complete(mice(imputedAnalysis,method = 'rf',seed = 617))
+imputedScoring = mice::complete(mice(imputedScoring,method = 'rf',seed = 617))
+
+```
+
+### REMOVING VARIABLE NOT SPECIFIC TO MODELS
+
+-   Here, I further removed variables that werent required in specific models
+
+```{r}
+imputedAnalysis <- imputedAnalysis %>% select(-power, -transmission_display, -exterior_color, -interior_color, -listed_date, -engine_type )
+```
+
+```{r}
+imputedScoring <- imputedScoring %>% select(-power, -transmission_display, -exterior_color, -interior_color, -listed_date, -engine_type )
+```
+
+***NOTE:** Since data was re-read, some of the steps had to be repeated*
+
+### CONVERT TO FACTORS
+
+```{r}
+imputedAnalysis$make_name <- as.factor(imputedAnalysis$make_name)
+imputedAnalysis$body_type <- as.factor(imputedAnalysis$body_type)
+imputedAnalysis$fuel_type <- as.factor(imputedAnalysis$fuel_type)
+imputedAnalysis$transmission <- as.factor(imputedAnalysis$transmission)
+imputedAnalysis$wheel_system <- as.factor(imputedAnalysis$wheel_system)
+imputedAnalysis$fleet <- as.factor(imputedAnalysis$fleet)
+imputedAnalysis$frame_damaged <- as.factor(imputedAnalysis$frame_damaged)
+imputedAnalysis$franchise_dealer <- as.factor(imputedAnalysis$franchise_dealer)
+imputedAnalysis$has_accidents <- as.factor(imputedAnalysis$has_accidents)
+imputedAnalysis$isCab <- as.factor(imputedAnalysis$isCab)
+imputedAnalysis$is_cpo <- as.factor(imputedAnalysis$is_cpo)
+imputedAnalysis$is_new <- as.factor(imputedAnalysis$is_new)
+imputedAnalysis$listing_color <- as.factor(imputedAnalysis$listing_color)
+imputedAnalysis$engine_initial <- as.factor(imputedAnalysis$engine_initial)
+imputedAnalysis$intcolor_cleaned <- as.factor(imputedAnalysis$intcolor_cleaned)
+imputedAnalysis$brand_type <- as.factor(imputedAnalysis$brand_type)
+#usedcars$model_name <- as.factor(usedcars$model_name)
+```
+
+```{r}
+imputedScoring$make_name <- as.factor(imputedScoring$make_name)
+imputedScoring$body_type <- as.factor(imputedScoring$body_type)
+imputedScoring$fuel_type <- as.factor(imputedScoring$fuel_type)
+imputedScoring$transmission <- as.factor(imputedScoring$transmission)
+imputedScoring$wheel_system <- as.factor(imputedScoring$wheel_system)
+imputedScoring$fleet <- as.factor(imputedScoring$fleet)
+imputedScoring$frame_damaged <- as.factor(imputedScoring$frame_damaged)
+imputedScoring$franchise_dealer <- as.factor(imputedScoring$franchise_dealer)
+imputedScoring$has_accidents <- as.factor(imputedScoring$has_accidents)
+imputedScoring$isCab <- as.factor(imputedScoring$isCab)
+imputedScoring$is_cpo <- as.factor(imputedScoring$is_cpo)
+imputedScoring$is_new <- as.factor(imputedScoring$is_new)
+imputedScoring$listing_color <- as.factor(imputedScoring$listing_color)
+imputedScoring$engine_initial <- as.factor(imputedScoring$engine_initial)
+imputedScoring$intcolor_cleaned <- as.factor(imputedScoring$intcolor_cleaned)
+imputedScoring$brand_type <- as.factor(imputedScoring$brand_type)
+```
+
+### TAKE ALL FACTORS
+
+-   I observed that some of the other factor variables were also causing issues. Hence I tried to add levels to both the datasets by creating a superset of levels which were there in both analysis and scoring data.
+
+```{r}
+update_levels <- function(column_name, train_data, score_data) {
+  # Convert column to factor in both datasets
+  train_data[[column_name]] <- as.factor(train_data[[column_name]])
+  score_data[[column_name]] <- as.factor(score_data[[column_name]])
+  
+  # Extract levels from both datasets
+  train_levels <- levels(train_data[[column_name]])
+  score_levels <- levels(score_data[[column_name]])
+  
+  # Combine unique levels and make them consistent in both datasets
+  all_levels <- union(train_levels, score_levels)
+  
+  # Update factor levels in both datasets
+  train_data[[column_name]] <- factor(train_data[[column_name]], levels = all_levels)
+  score_data[[column_name]] <- factor(score_data[[column_name]], levels = all_levels)
+  
+  # No return needed; dataframes are updated in place
+  invisible(NULL)
+}
+```
+
+```{r}
+update_levels("make_name", imputedAnalysis, imputedScoring)
+update_levels("engine_initial", imputedAnalysis, imputedScoring)
+update_levels("body_type", imputedAnalysis, imputedScoring)
+update_levels("fuel_type", imputedAnalysis, imputedScoring)
+update_levels("transmission", imputedAnalysis, imputedScoring)
+update_levels("wheel_system", imputedAnalysis, imputedScoring)
+update_levels("fleet", imputedAnalysis, imputedScoring)
+update_levels("frame_damaged", imputedAnalysis, imputedScoring)
+update_levels("franchise_dealer", imputedAnalysis, imputedScoring)
+update_levels("has_accidents", imputedAnalysis, imputedScoring)
+update_levels("isCab", imputedAnalysis, imputedScoring)
+update_levels("is_cpo", imputedAnalysis, imputedScoring)
+update_levels("is_new", imputedAnalysis, imputedScoring)
+update_levels("listing_color", imputedAnalysis, imputedScoring)
+update_levels("intcolor_cleaned", imputedAnalysis, imputedScoring)
+```
+
+```{r}
+imputedAnalysis$engine_initial <- as.factor(imputedAnalysis$engine_initial)
+imputedScoring$engine_initial <- as.factor(imputedScoring$engine_initial)
+train_levels <- levels(imputedAnalysis$engine_initial)
+score_levels <- levels(imputedScoring$engine_initial)
+# Combine unique levels and make them consistent in both datasets
+all_levels <- union(train_levels, score_levels)
+
+# Update factor levels in both datasets
+imputedAnalysis$engine_initial <- factor(imputedAnalysis$engine_initial, levels = all_levels)
+imputedScoring$engine_initial <- factor(imputedScoring$engine_initial, levels = all_levels)
+```
+
+### CHECK COUNTS
+
+```{r}
+fct_count(train$engine_initial)
+fct_count(test$engine_initial)
+```
+
+### REMOVING VARIABLE NOT SPECIFIC TO MODELS
+
+-   Here, I further removed variables that weren't required in specific models (This step is repeated because different set of variables were used and run through multiple models)
+
+```{r}
+imputedAnalysis <- imputedAnalysis %>% select( -make_name,-avg_economy, -city_fuel_economy, -front_legroom_inches, -width_inches, -fleet, -franchise_dealer, -salvage, -intcolor_cleaned )
+```
+
+```{r}
+imputedScoring <- imputedScoring %>% select( -make_name,-avg_economy, -city_fuel_economy, -front_legroom_inches, -width_inches, -fleet, -franchise_dealer, -salvage, -intcolor_cleaned )
+```
+
+### SPLITTING THE DATA
+
+```{r}
+set.seed(1000)
+split = createDataPartition(y=imputedAnalysis$price, p =0.7,list = F, groups =100)
+train = imputedAnalysis[split,]
+test = imputedAnalysis[-split,]
+
+```
+
+Rough Work
+
+```{r}
+# Check predictor variable names in the model
+model_predictors <- (forest_ranger$forest$independent.variable.names)
+
+# Check if all predictor variables are present in the scoring dataset
+missing_vars <- setdiff(model_predictors, names(imputedScoring))
+
+# Print missing variables
+print(missing_vars)
+
+```
+
+### For Principal Component Analysis [*(do not run the following three code blocks)*]{style="color:red;"}
+
+-   I tried to run using PCA, but it was not providing better results
+
+```{r}
+numeric_columns <- names(imputedAnalysis)[sapply(imputedAnalysis, is.numeric)]
+
+# Get numeric columns from the dataframe
+numeric_df <- imputedAnalysis[numeric_columns]
+column_to_remove <- "price"  # Replace with the column name you want to remove
+
+# Remove the specific column while keeping the rest
+numeric_df <- numeric_df[, !(names(numeric_df) %in% column_to_remove)]
+pca = prcomp(numeric_df,scale. = T)
+```
+
+```{r}
+train_components = data.frame(cbind(pca$x[,1:12], price = imputedAnalysis$price))
+```
+
+```{r}
+test_pca = predict(pca,newdata=imputedScoring)
+test_components = data.frame(cbind(test_pca[,1:12]))
+```
+
+### FITTING MODELS
+
+*NOTE: For best model, go to the very end of this section*
+
+1.  LM
+
+```{r}
+lm <- lm(price ~ fuel_tank_volume_gallons + body_type+fuel_type+engine_displacement+poly(NumCylinders,2)+(transmission*transmission_number)+wheel_system+poly(yearage_at_listing,2)+is_new+brand_type+rpm,data=train)
+```
+
+```{r}
+pred <- predict(lm)
+RMSE <- sqrt(mean((pred - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(lm, newdata = test)
+RMSE <- sqrt(mean((pred_test - test$price)^2))
+RMSE
+```
+
+2\. BAGGING
+
+```{r}
+set.seed(1000)
+bag <- bagging(price ~fuel_tank_volume_gallons + body_type+fuel_type+engine_displacement+(NumCylinders*engine_initial)+(transmission*transmission_number)+wheel_system+yearage_at_listing+is_new+brand_type+rpm,data=train, nbagg=100)
+```
+
+```{r}
+pred <- predict(bag)
+RMSE <- sqrt(mean((pred - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(bag, newdata = test)
+RMSE <- sqrt(mean((pred_test - test$price)^2))
+RMSE
+```
+
+3.  Decision Tree
+
+```{r}
+set.seed(1000)
+tree <- rpart(price ~fuel_tank_volume_gallons + body_type+fuel_type+engine_displacement+NumCylinders+engine_initial+transmission+transmission_number+wheel_system+yearage_at_listing+is_new+brand_type+rpm, data=train, method="anova")
+```
+
+```{r}
+pred <- predict(tree)
+RMSE <- sqrt(mean((pred - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(tree, newdata = test)
+RMSE <- sqrt(mean((pred_test - test$price)^2))
+RMSE
+```
+
+4.  Decision Tree with all predictors
+
+```{r}
+set.seed(1000)
+tree <- rpart(price ~ ., method="anova", data=train)
+```
+
+```{r}
+pred <- predict(tree)
+RMSE <- sqrt(mean((pred - train$price)^2))
+RMSE
+```
+
+```{r}
+pred <- predict(tree, newdata=test)
+RMSE <- sqrt(mean((pred - test$price)^2))
+RMSE
+```
+
+4.1. Ranger
+
+```{r}
+library(ranger)
+set.seed(1031)
+forest_ranger = ranger(price ~ brand_type +fuel_tank_volume_gallons + body_type+fuel_type+engine_displacement+NumCylinders+engine_initial+transmission+wheel_system+yearage_at_listing+is_new + length_inches+horsepower+daysonmarket+has_accidents+mileage+owner_count+NumCylinders+yearage_at_listing+heated_seats+steel_wheels+num_features, 
+data=train,num.trees = 1500, mtry =20)
+```
+
+```{r}
+pred <- predict(forest_ranger, data = train)
+RMSE <- sqrt(mean((pred$predictions - train$price)^2))
+RMSE
+```
+
+```{r}
+pred <- predict(forest_ranger, data=test)
+RMSE <- sqrt(mean((pred$predictions - test$price)^2))
+RMSE
+```
+
+4\. 2. Ranger Part-2
+
+```{r}
+# Assuming "exclude_var1" and "exclude_var2" are columns you want to exclude
+columns_to_exclude <- c("highway_fuel_economy", "city_fuel_economy", "front_legroom_inches", "size", "width_inches","listing_color", "intcolor_cleaned","rpm","maximum_seating","price","torque")
+
+# Create the formula by selecting all columns except the excluded ones
+formula <- as.formula(
+  paste("price ~ ",
+        paste(setdiff(names(train), columns_to_exclude), collapse = " + "))
+)
+
+# Fit the ranger model using the customized formula
+forest_ranger <- ranger(formula, importance="impurity",data = train, num.trees = 1000)
+
+pred <- predict(forest_ranger, data = train, num.trees = 1000)
+RMSE <- sqrt(mean((pred$predictions - train$price)^2))
+RMSE
+
+pred_test <- predict(forest_ranger, data = test, num.trees = 1000)
+RMSE <- sqrt(mean((pred_test$prediction - test$price)^2))
+RMSE
+```
+
+4.3. Ranger Part-3
+
+```{r}
+forest_ranger <- ranger(price~.,data = train, num.trees = 1500)
+```
+
+```{r}
+pred <- predict(forest_ranger, data = train, num.trees = 1500)
+RMSE <- sqrt(mean((pred$predictions - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(forest_ranger, data = test, num.trees = 1500)
+RMSE <- sqrt(mean((pred_test$prediction - test$price)^2))
+RMSE
+```
+
+4.4 Ranger to check variable importance
+
+```{r}
+forest_ranger = ranger(price~body_type+ fuel_tank_volume_gallons + fuel_type + highway_fuel_economy + transmission  + wheel_system  + back_legroom_inches + length_inches + height_inches  + engine_displacement + horsepower + daysonmarket   + maximum_seating +frame_damaged+ has_accidents + +is_cpo+isCab + is_new + mileage + owner_count +  seller_rating +yearage_at_listing+num_features+NumCylinders + engine_initial + steel_wheels,data = train, 
+                       num.trees =1200,mtry=15, importance = "impurity")
+```
+
+```{r}
+summary(forest_ranger)
+```
+
+```{r}
+pred <- predict(forest_ranger, data = train, num.trees = 1200)
+RMSE <- sqrt(mean((pred$predictions - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(forest_ranger, data = test, num.trees = 1200)
+RMSE <- sqrt(mean((pred_test$prediction - test$price)^2))
+RMSE
+```
+
+```{r}
+summary(forest_ranger)
+```
+
+```{r}
+vecto <- pred$predictions
+```
+
+5.  Ranger Tuned
+
+```{r}
+trControl=trainControl(method="cv",number=3)
+tuneGrid = expand.grid(mtry=10:15, 
+                       splitrule = c('variance','maxstat'), 
+                       min.node.size = c(2,5))
+set.seed(42)
+cvModel = train(price ~ brand_type +fuel_tank_volume_gallons + body_type+fuel_type+highway_fuel_economy+engine_displacement+NumCylinders+engine_initial+transmission+wheel_system+yearage_at_listing+is_new+torque+ length_inches+horsepower+daysonmarket+has_accidents+mileage+owner_count+NumCylinders+yearage_at_listing+heated_seats+steel_wheels+num_features, 
+data=train, 
+                method="ranger",
+                num.trees=100,
+                trControl=trControl,
+                tuneGrid=tuneGrid)
+cvModel$bestTune
+```
+
+```{r}
+set.seed(42)
+cv_forest_ranger = ranger(price ~ brand_type +fuel_tank_volume_gallons + body_type+fuel_type+highway_fuel_economy+engine_displacement+NumCylinders+engine_initial+transmission+wheel_system+yearage_at_listing+is_new+torque+ length_inches+horsepower+daysonmarket+has_accidents+mileage+owner_count+NumCylinders+yearage_at_listing+heated_seats+steel_wheels+num_features, 
+data=train,
+                          num.trees = 100, 
+                          mtry=cvModel$bestTune$mtry, 
+                          min.node.size = cvModel$bestTune$min.node.size, 
+                          splitrule = cvModel$bestTune$splitrule)
+```
+
+```{r}
+pred <- predict(cv_forest_ranger, data = train, num.trees = 100)
+RMSE <- sqrt(mean((pred$predictions - train$price)^2))
+RMSE
+```
+
+```{r}
+pred_test <- predict(cv_forest_ranger, data = test, num.trees = 100)
+RMSE <- sqrt(mean((pred_test$prediction - test$price)^2))
+RMSE
+```
+
+```{r}
+pred <- predict(cv_forest_ranger, data = imputedScoring, num.trees = 100)
+```
+
+```{r}
+vecto <- pred$predictions
+```
+
+```{r}
+submissionFile = data.frame(id = imputedScoring$id, price = vecto)
+write.csv(submissionFile, 'sample_submission.csv',row.names = F)
+```
+
+\
+6. XG Boost
+
+-   Trying to run XGBoost with just numeric predictors
+
+```{r}
+numeric_columns <- sapply(imputedAnalysis, is.numeric)
+df_without_numeric_analysis <- imputedAnalysis[, !numeric_columns]
+
+numeric_columns <- sapply(imputedScoring, is.numeric)
+df_without_numeric_scoring <- imputedScoring[, !numeric_columns]
+
+# Bind the train_components to the dataframe
+final_df_analysis <- cbind(df_without_numeric_analysis, train_components)
+final_df_scoring <- cbind(df_without_numeric_scoring, test_components)
+
+set.seed(1000)
+split = createDataPartition(y=final_df_analysis$price, p =0.7,list = F, groups =100)
+train = final_df_analysis[split,]
+test = final_df_analysis[-split,]
+```
+
+```{r}
+newtrain <- train |>
+  select(-back_legroom_inches, -wheelbase_inches,-rpm,-isCab, -luxury, -size, -brand_type, -third_row, -roofs, -heated_seats)
+newtest <- test |>
+  select(-back_legroom_inches, -wheelbase_inches,-rpm,-isCab, -luxury, -size, -brand_type, -third_row, -roofs, -heated_seats)
+newScore <- imputedScoring |>
+  select(-back_legroom_inches, -wheelbase_inches,-rpm,-isCab, -luxury, -size, -brand_type, -third_row, -roofs, -heated_seats)
+```
+
+```{r}
+
+library(vtreat)
+remaining_columns <- names(newtrain)[-which(names(newtrain) == 'price')]
+print(remaining_columns)
+
+trt = designTreatmentsZ(dframe = newtrain,
+                        varlist = remaining_columns)
+```
+
+```{r}
+newvars = trt$scoreFrame[trt$scoreFrame$code%in% c('clean','lev'),'varName']
+
+train_input = prepare(treatmentplan = trt, 
+                      dframe = newtrain,
+                      varRestriction = newvars)
+test_input = prepare(treatmentplan = trt, 
+                     dframe = newtest,
+                     varRestriction = newvars)
+scoringNew = prepare(treatmentplan = trt, 
+                     dframe = newScore,
+                     varRestriction = newvars)
+```
+
+```{r}
+library(xgboost)
+library(parallel)
+xgboost = xgboost(data=as.matrix(train_input), 
+                  label = train$price,
+                  nrounds=1000,
+                  verbose = 1,
+                  nthread=4,
+                  early_stopping_rounds = 100)
+xgboost$best_iteration
+```
+
+```{r}
+pred_train = predict(xgboost, 
+               newdata=as.matrix(train_input))
+rmse_train_xgboost = sqrt(mean((pred_train - train$price)^2)); rmse_train_xgboost
+```
+
+```{r}
+pred = predict(xgboost, 
+               newdata=as.matrix(test_input))
+rmse_xgboost = sqrt(mean((pred - test$price)^2)); rmse_xgboost
+```
+
+```{r}
+pred = predict(xgboost, 
+               newdata=as.matrix(scoringNew))
+rmse_xgboost = sqrt(mean((pred - imputed$price)^2)); rmse_xgboost
+```
+
+Side-by-side Boosting
+
+```{r}
+tune_nrounds = xgb.cv(data=as.matrix(train_input), 
+                      label = train$price,
+                      nrounds=1000, 
+                      nfold = 5,
+                      verbose = 1)
+```
+
+```{r}
+xgboost = xgboost(data=as.matrix(train_input), 
+                  label = train$price,
+                  nrounds=3500,
+                  verbose = 1,
+                  nthread=4,
+                  early_stopping_rounds = 100)
+xgboost$best_iteration
+```
+
+```{r}
+pred_train = predict(xgboost, 
+               newdata=as.matrix(train_input))
+rmse_train_xgboost = sqrt(mean((pred_train - train$price)^2)); rmse_train_xgboost
+```
+
+```{r}
+pred = predict(xgboost, 
+               newdata=as.matrix(test_input))
+rmse_xgboost = sqrt(mean((pred - test$price)^2)); rmse_xgboost
+```
+
+```{r}
+pred = predict(xgboost, 
+               newdata=as.matrix(scoringNew))
+```
+
+```{r}
+which.min(tune_nrounds$evaluation_log$test_rmse_mean)
+```
+
+```{r}
+submissionFile = data.frame(id = imputedScoring$id, price = pred)
+write.csv(submissionFile, 'sample_submission.csv',row.names = F)
+```
